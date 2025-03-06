@@ -1,0 +1,562 @@
+
+```{r}
+
+#load libraries
+library(tidyverse)
+library(ROCR)
+library(dplyr)
+library(glmnet)
+library(caret)
+library(randomForest)
+library(gbm)
+library(text2vec)
+library(tm)
+library(SnowballC)
+options(scipen=999)
+```
+
+```{r}
+
+#load data files
+train_x <- read_csv("airbnb_train_x_2024.csv")
+train_y <- read_csv("airbnb_train_y_2024.csv")
+test_x <- read_csv("airbnb_test_x_2024.csv")
+```
+
+
+```{r}
+# Cleaning the training data
+
+# Select Required Columns
+clean_train <- train_x %>%
+  select(market, property_type, room_type, access,
+         transit, host_response_time, host_response_rate,
+         host_acceptance_rate, accommodates, amenities, bathrooms, bedrooms, 
+         price, guests_included, extra_people, minimum_nights,
+         availability_30, availability_60, cancellation_policy, features,
+         cleaning_fee)
+
+# Feature Engineering
+clean_train <- clean_train %>%
+  mutate(features = ifelse(is.na(features), "No Features", features),
+         is_superhost = as.factor(ifelse(grepl("Host Is Superhost", features), 1, 0)),
+         is_verified = as.factor(ifelse(grepl("Host Identity Verified", features), 1, 0)),
+         is_instant_bookable = as.factor(ifelse(grepl("Instant Bookable", features), 1, 0)),
+         cancellation_policy = as.factor(ifelse(cancellation_policy %in% c(
+           "no_refunds", "super_strict_30", "super_strict_60"), "strict", cancellation_policy)),
+         accommodates = ifelse(is.na(accommodates), mean(accommodates, na.rm=TRUE), accommodates),
+         bathrooms=ifelse(is.na(bathrooms),mean(bathrooms, na.rm=TRUE),bathrooms),
+         bedrooms=ifelse(is.na(bedrooms), mean(bedrooms, na.rm=TRUE),bedrooms),
+         price=ifelse(is.na(price),mean(price, na.rm=TRUE),price),
+         property_type = as.factor(case_when(
+           property_type %in% c("House", "Apartment", "Townhouse", "Condominium", "Villa", "Loft") ~ "Residential",
+           property_type %in% c("Bed&Breakfast", "Hostel", "Guesthouse", "Boutiquehotel", "Guestsuite", "Vacationhome") 
+           ~ "Lodging",
+           property_type %in% c("Boat", "Treehouse", "Cave","Chalet", "Castle",
+                                "Yurt", "Lighthouse", "Tipi", "Train", "Plane") ~ "Unique Accommodation",
+           property_type %in% c("Camper/RV", "Hut", "EarthHouse", "Cabin", "Tent", "Island") ~ "Outdoor Accommodation",
+           TRUE ~ "Other")),
+         room_type = as.factor(room_type),
+         host_acceptance_rate = ifelse(!is.na(host_acceptance_rate), as.numeric(gsub("%", "", host_acceptance_rate)),
+                                       host_acceptance_rate),
+         amenities = sapply(strsplit(as.character(amenities), ","), length)) %>%
+  mutate(high_booking_rate = as.factor(train_y$high_booking_rate)) %>%
+  select(-features)
+
+#Replacing NAs in price with mean of market, room type
+mean_price <- clean_train %>%
+  filter(!is.na(price)) %>%
+  group_by(market, room_type) %>%
+  summarise(avg_price = mean(as.numeric(price)))
+
+clean_train <- clean_train %>%
+  left_join(mean_price, by = c("market","room_type")) %>%
+  mutate(price = ifelse(is.na(price), avg_price, as.numeric(price))) %>% 
+  select(-avg_price)
+
+#Replacing NAs in host_response_rate with mean of property type
+mean_response_rate <- clean_train %>%
+  filter(!is.na(host_response_rate)) %>%
+  group_by(is_superhost, is_instant_bookable) %>%
+  summarise(avg_response_rate = mean(as.numeric(host_response_rate)))
+
+clean_train <- clean_train %>%
+  left_join(mean_response_rate, by = c("is_superhost","is_instant_bookable")) %>%
+  mutate(host_response_rate = ifelse(is.na(host_response_rate), 
+                                     avg_response_rate, as.numeric(host_response_rate))) %>% 
+  select(-avg_response_rate)
+
+#Replacing NAs in host_acceptance_rate with mean of property type
+mean_acceptance_rate <- clean_train %>%
+  filter(!is.na(host_acceptance_rate)) %>%
+  group_by(property_type) %>%
+  summarise(avg_acceptance_rate = mean(as.numeric(host_acceptance_rate)))
+
+clean_train <- clean_train %>%
+  left_join(mean_acceptance_rate, by = "property_type") %>%
+  mutate(host_acceptance_rate = ifelse(is.na(host_acceptance_rate), 
+                                       avg_acceptance_rate, as.numeric(host_acceptance_rate))) %>% 
+  select(-avg_acceptance_rate)
+  
+#Replacing NA in Cleaning Fee
+mean_cleaning_fee <- clean_train %>%
+  filter(!is.na(cleaning_fee)) %>%
+  group_by(bedrooms) %>%
+  summarise(avg_cleaning_fee = mean(cleaning_fee))
+
+clean_train <- clean_train %>%
+  left_join(mean_cleaning_fee, by = "bedrooms") %>% 
+  mutate(cleaning_fee = ifelse(is.na(cleaning_fee), avg_cleaning_fee, cleaning_fee)) %>% 
+  select(-avg_cleaning_fee)
+
+# Replacing NA in Host Response time based on top counts of a response time
+response_time_weights <- clean_train %>%
+  filter(!is.na(host_response_time)) %>%
+  group_by(market, property_type, host_response_time) %>%
+  summarise(majority_response_time = n()) %>%
+  top_n(1, majority_response_time) %>%
+  slice(1) %>%
+  rename(majority_time = host_response_time) %>%
+  select(-majority_response_time)
+
+clean_train <- clean_train %>%
+  left_join(response_time_weights, by = c("market", "property_type")) %>%
+  mutate(host_response_time = ifelse(is.na(host_response_time), 
+                                     ifelse(is.na(majority_time), "within a day", majority_time), host_response_time)) %>% 
+  select(-majority_time, - market) %>%
+  mutate(host_response_time = as.factor(host_response_time))
+
+```
+
+```{r}
+#Cleaning the Test Data
+
+# Select Required Columns
+clean_test <- test_x %>%
+  select(market, property_type, room_type, access,
+         transit, host_response_time, host_response_rate,
+         host_acceptance_rate, accommodates, amenities, bathrooms, bedrooms, 
+         price, guests_included, extra_people, minimum_nights,
+         availability_30, availability_60, cancellation_policy, features,
+         cleaning_fee)
+
+# Feature Engineering
+clean_test <- clean_test %>%
+  mutate(features = ifelse(is.na(features), "No Features", features),
+         is_superhost = as.factor(ifelse(grepl("Host Is Superhost", features), 1, 0)),
+         is_verified = as.factor(ifelse(grepl("Host Identity Verified", features), 1, 0)),
+         is_instant_bookable = as.factor(ifelse(grepl("Instant Bookable", features), 1, 0)),
+         cancellation_policy = as.factor(ifelse(cancellation_policy %in% c(
+           "no_refunds", "super_strict_30", "super_strict_60"), "strict", cancellation_policy)),
+         accommodates = ifelse(is.na(accommodates), mean(accommodates, na.rm=TRUE), accommodates),
+         bathrooms=ifelse(is.na(bathrooms),mean(bathrooms, na.rm=TRUE),bathrooms),
+         bedrooms=ifelse(is.na(bedrooms), mean(bedrooms, na.rm=TRUE),bedrooms),
+         property_type = as.factor(case_when(
+           property_type %in% c("House", "Apartment", "Townhouse", "Condominium", "Villa", "Loft") ~ "Residential",
+           property_type %in% c("Bed&Breakfast", "Hostel", "Guesthouse", "Boutiquehotel", "Guestsuite", "Vacationhome") ~ "Lodging",
+           property_type %in% c("Boat", "Treehouse", "Cave","Chalet", "Castle",
+                                "Yurt", "Lighthouse", "Tipi", "Train", "Plane") ~ "Unique Accommodation",
+           property_type %in% c("Camper/RV", "Hut", "EarthHouse", "Cabin", "Tent", "Island") ~ "Outdoor Accommodation",
+           TRUE ~ "Other")),
+         room_type = as.factor(room_type),
+         host_acceptance_rate = ifelse(!is.na(host_acceptance_rate), as.numeric(gsub("%", "", host_acceptance_rate)), host_acceptance_rate),
+         amenities = sapply(strsplit(as.character(amenities), ","), length)) %>%
+  select(-features)
+
+#Replacing NAs in price with mean of market, room type
+mean_price <- clean_test %>%
+  filter(!is.na(price)) %>%
+  group_by(market, room_type) %>%
+  summarise(avg_price = mean(as.numeric(price)))
+
+clean_test <- clean_test %>%
+  left_join(mean_price, by = c("market","room_type")) %>%
+  mutate(price = ifelse(is.na(price), avg_price, as.numeric(price))) %>% 
+  select(-avg_price)
+
+#Replacing NAs in host_response_rate with mean of property type
+mean_response_rate <- clean_test %>%
+  filter(!is.na(host_response_rate)) %>%
+  group_by(is_superhost, is_instant_bookable) %>%
+  summarise(avg_response_rate = mean(as.numeric(host_response_rate)))
+
+clean_test <- clean_test %>%
+  left_join(mean_response_rate, by = c("is_superhost","is_instant_bookable")) %>%
+  mutate(host_response_rate = ifelse(is.na(host_response_rate), avg_response_rate, as.numeric(host_response_rate))) %>% 
+  select(-avg_response_rate)
+
+#Replacing NAs in host_acceptance_rate with mean of property type
+mean_acceptance_rate <- clean_test %>%
+  filter(!is.na(host_acceptance_rate)) %>%
+  group_by(property_type) %>%
+  summarise(avg_acceptance_rate = mean(as.numeric(host_acceptance_rate)))
+
+clean_test <- clean_test %>%
+  left_join(mean_acceptance_rate, by = "property_type") %>%
+  mutate(host_acceptance_rate = ifelse(is.na(host_acceptance_rate), avg_acceptance_rate, as.numeric(host_acceptance_rate))) %>% 
+  select(-avg_acceptance_rate)
+  
+#Replacing NA in Cleaning Fee
+mean_cleaning_fee <- clean_test %>%
+  filter(!is.na(cleaning_fee)) %>%
+  group_by(bedrooms) %>%
+  summarise(avg_cleaning_fee = mean(cleaning_fee))
+
+clean_test <- clean_test %>%
+  left_join(mean_cleaning_fee, by = "bedrooms") %>% 
+  mutate(cleaning_fee = ifelse(is.na(cleaning_fee), avg_cleaning_fee, cleaning_fee)) %>% 
+  select(-avg_cleaning_fee)
+
+# Replacing NA in Host Response time based on top counts of a response time
+response_time_weights <- clean_test %>%
+  filter(!is.na(host_response_time)) %>%
+  group_by(market, property_type, host_response_time) %>%
+  summarise(majority_response_time = n()) %>%
+  top_n(1, majority_response_time) %>%
+  slice(1) %>%
+  rename(majority_time = host_response_time) %>%
+  select(-majority_response_time)
+
+clean_test <- clean_test %>%
+  left_join(response_time_weights, by = c("market", "property_type")) %>%
+  mutate(host_response_time = ifelse(is.na(host_response_time), 
+                                     ifelse(is.na(majority_time), "within a day", majority_time), host_response_time)) %>%
+  select(-majority_time, - market) %>%
+  mutate(host_response_time = as.factor(host_response_time))
+
+
+```
+
+```{r}
+# text mining for access and transit variables
+
+# Processing "Transit" variable
+cleaning_tokenizer <- function(v) {
+  v %>%
+    removeNumbers() %>% #remove all numbers
+    removePunctuation() %>% #remove all punctuation
+    removeWords(tm::stopwords(kind="en")) %>% #remove stopwords
+    stemDocument() %>% #stemming
+    word_tokenizer 
+}
+it_train_transit <- itoken(clean_train$transit, 
+                   preprocessor = tolower, #preprocessing by converting to lowercase
+                   tokenizer = cleaning_tokenizer,
+                   progressbar = FALSE)
+vocab_transit <- create_vocabulary(it_train_transit, ngram=c(1L, 2L))
+
+vocab_small_transit <- prune_vocabulary(vocab_transit,term_count_min = 10000)
+
+it_test_transit <- itoken(clean_test$transit, 
+                   preprocessor = tolower, #preprocessing by converting to lowercase
+                   tokenizer = cleaning_tokenizer,  
+                   progressbar = FALSE)
+
+vectorizer_transit <- vocab_vectorizer(vocab_small_transit)
+
+dtm_train_transit <- create_dtm(it_train_transit, vectorizer_transit)
+
+dtm_test_transit <- create_dtm(it_test_transit, vectorizer_transit)
+
+# Processing "access" variable
+it_train_access <- itoken(clean_train$access, 
+                   preprocessor = tolower, #preprocessing by converting to lowercase
+                   tokenizer = cleaning_tokenizer,
+                   progressbar = FALSE)
+
+stop_words <- c("access", "will", "live", "use","area","includ*","NA", "park", "avail")
+
+vocab_access <- create_vocabulary(it_train_access, stopwords = stop_words, ngram=c(1L, 2L))
+
+vocab_small_access <- prune_vocabulary(vocab_access,term_count_min = 7000)
+
+it_test_access <- itoken(clean_test$access, 
+                   preprocessor = tolower, #preprocessing by converting to lowercase
+                   tokenizer = cleaning_tokenizer,  
+                   progressbar = FALSE)
+
+vectorizer_access <- vocab_vectorizer(vocab_small_access)
+
+dtm_train_access <- create_dtm(it_train_access, vectorizer_access)
+
+dtm_test_access <- create_dtm(it_test_access, vectorizer_access)
+
+# Select y-variable
+tr_y <- clean_train$high_booking_rate
+
+# Deselect text-mining columns
+clean_train_x <- clean_train %>%
+  select(-transit, -access, -high_booking_rate)
+
+clean_test_x <- clean_test %>%
+  select(-transit, -access)
+
+dense_train_access <- as.matrix(dtm_train_access)
+
+dense_test_access <- as.matrix(dtm_test_access)
+
+dense_train_transit <- as.matrix(dtm_train_transit)
+
+dense_test_transit <- as.matrix(dtm_test_transit)
+
+# Combine text columns with original selected columns
+combined_train <- cbind(clean_train_x, dense_train_access, dense_train_transit)
+
+combined_test <- cbind(clean_test_x,dense_test_access, dense_test_transit)
+
+# Deselect duplicated terms from combined data
+combined_train <- combined_train %>%
+  select(-also, -can)
+
+combined_test <- combined_test %>%
+  select(-also, -can)
+
+```
+
+```{r}
+library(corrplot)
+
+# Plot correlation matrix
+
+corr_matrix <- cor(select_if(combined_train, is.numeric))
+corrplot(corr_matrix, method = "color")
+
+# Find indices where correlation is greater than 0.8
+high_corr_indices <- which(upper.tri(corr_matrix, diag = TRUE) & abs(corr_matrix) > 0.75, arr.ind = TRUE)
+
+# Extract variable pairs with high correlation
+high_corr_pairs <- data.frame(Variable1 = rownames(corr_matrix)[high_corr_indices[, 1]],
+                              Variable2 = colnames(corr_matrix)[high_corr_indices[, 2]],
+                              Correlation = corr_matrix[high_corr_indices])
+
+high_corr_pairs_filtered <- high_corr_pairs[high_corr_pairs$Variable1 != high_corr_pairs$Variable2, ]
+
+# Print the filtered dataframe
+print(high_corr_pairs_filtered)
+
+```
+
+
+```{r}
+# Final Mpdel used for predicting values.
+
+# Building RF Model
+rf.mod <- randomForest(x=combined_train,
+                       y=tr_y,
+                       mtry=9, ntree=500,
+                       importance=TRUE)
+rf_preds <- predict(rf.mod, newdata=combined_test, type="prob")
+assertthat::assert_that(sum(is.na(rf_preds))==0)
+#write.table(rf_preds[,2], "high_booking_rate_group6.csv", row.names = FALSE)
+
+# Code to check training AUC
+rf_preds_train <- predict(rf.mod, newdata=combined_train, type="prob")
+rf_preds_train <- prediction(rf_preds_train[,2], tr_y)
+performance(rf_preds_train, measure = "auc")@y.values[[1]]
+roc_log <- performance(rf_preds_train, "tpr", "fpr")
+plot.new()
+plot(roc_log, col = "grey", ylab = '', lwd = 2)
+```
+
+```{r}
+# Appendix - All the below are trial models that we did not end up using as our final model
+
+# RF model
+
+clean_train_X <- clean_train %>%
+  select(property_type, room_type, host_response_rate, accommodates, bathrooms, bedrooms, beds, price, guests_included,  extra_people, minimum_nights, availability_30, availability_60, cancellation_policy, is_superhost, is_verified, is_instant_bookable, amenities, host_acceptance_rate, host_response_time)
+
+train_y <- clean_train$high_booking_rate
+
+rf.mod <- randomForest(x=clean_train_X,
+                       y=train_y,
+                       mtry=5, ntree=500,
+                       importance=TRUE)
+
+clean_test_X <- clean_test %>%
+  select(property_type, room_type, host_response_rate, accommodates, bathrooms, bedrooms, beds, price, guests_included,  extra_people, minimum_nights, availability_30, availability_60, cancellation_policy, is_superhost, is_verified, is_instant_bookable, amenities, host_acceptance_rate, host_response_time)
+
+rf_preds <- predict(rf.mod, newdata=clean_train_X, type="prob")
+assertthat::assert_that(sum(is.na(rf_preds))==0)
+#write.table(rf_preds[,2], "high_booking_rate_group6.csv", row.names = FALSE)
+
+pred_rf <- prediction(rf_preds[,2], train_y)
+performance(pred_rf, measure = "auc")@y.values[[1]]
+
+
+```
+
+```{r}
+#Boosting Model
+boost_features <- high_booking_rate ~ property_type + room_type + 
+  host_response_rate  + accommodates + bathrooms + bedrooms + beds + price + guests_included + extra_people + 
+  minimum_nights + availability_30 + availability_60 + cancellation_policy +
+  is_superhost + is_verified + is_instant_bookable + amenities + host_acceptance_rate + host_response_time
+
+clean_train_boost <- clean_train
+
+clean_train_boost <- clean_train_boost %>%
+  mutate(high_booking_rate = as.numeric(high_booking_rate))
+
+combined_train_boost <- combined_train
+
+combined_train_boost$high_booking_rate <- clean_train$high_booking_rate
+combined_train_boost <- combined_train_boost %>%
+  mutate(high_booking_rate = ifelse(high_booking_rate == "YES", 1, 0))
+
+combined_train_boost <- combined_train_boost %>%
+  mutate(high_booking_rate = as.numeric(high_booking_rate))
+
+boost.mod <- gbm(high_booking_rate~.,data=combined_train_boost,
+                 distribution="bernoulli",
+                 n.trees=5000,
+                 interaction.depth=2)
+boost_preds <- predict(boost.mod,
+                       newdata=combined_train,
+                       type='response',
+                       n.trees=5000)
+assertthat::assert_that(sum(is.na(boost_preds))==0)
+pred_rf <- prediction(boost_preds, tr_y)
+performance(pred_rf, measure = "auc")@y.values[[1]]
+```
+
+```{r}
+
+
+# Logistic Model
+logistic_features <- high_booking_rate ~ property_type + room_type + 
+  host_response_rate  + accommodates + bathrooms + bedrooms + beds + price + guests_included + extra_people + 
+  minimum_nights + availability_30 + availability_60 + cancellation_policy +
+  is_superhost + is_verified + is_instant_bookable + amenities + host_acceptance_rate + host_response_time
+
+log_model <- glm(logistic_features, family = "binomial", data = clean_train)
+
+probs_rate <- predict(log_model, newdata = clean_train, type = "response")
+assertthat::assert_that(sum(is.na(probs_rate))==0)
+#write.table(probs_rate, "high_booking_rate_group6.csv", row.names = FALSE)
+
+# Create ROCR prediction object
+pred_logistic <- prediction(probs_rate, clean_train$high_booking_rate)
+roc_full <- performance(pred_logistic, "tpr", "fpr")
+performance(pred_logistic, measure = "auc")@y.values[[1]]
+```
+
+```{r}
+lasso_var <- clean_train %>%
+  select(property_type, room_type, host_response_rate, accommodates, bathrooms, bedrooms, beds,
+         price, guests_included, extra_people, minimum_nights, availability_30, availability_60,
+         cancellation_policy, is_superhost, is_verified, is_instant_bookable, amenities)
+
+dummy <- dummyVars(~., data = lasso_var, fullRank = TRUE)
+one_hot_airbnb <- predict(dummy, newdata = lasso_var)
+
+```
+
+```{r}
+# define a function to calculate accuracy
+accuracy <- function(classifications, actuals){
+  correct_classifications <- ifelse(classifications == actuals, 1, 0)
+  acc <- sum(correct_classifications)/length(classifications)
+  return(acc)
+}
+```
+
+```{r}
+# Ridge and Lasso
+glm.out.ridge <- glmnet(lasso_var, train_y$high_booking_rate, alpha = 0, family="binomial")
+glm.out.lasso <- glmnet(lasso_var, train_y$high_booking_rate, alpha = 1, family="binomial")
+
+print(plot(glm.out.ridge, xvar = "lambda"))
+plot(glm.out.lasso, xvar = "lambda")
+
+```
+
+```{r}
+grid <- 10^seq(-1,-4,length=100)
+
+accs <- rep(0, length(grid))
+
+for(i in c(1:length(grid))){
+  lam = grid[i] #current value of lambda
+
+  #train a ridge model with lambda = lam
+  glmout <- glmnet(lasso_var, train_y$high_booking_rate, family = "binomial", alpha = 1, lambda = lam)
+  
+  #make predictions as usual
+  preds <- predict(glmout, newx = as.matrix(lasso_var), type = "response")
+  
+  #classify and compute accuracy
+  classifications <- ifelse(preds > .5, "YES", "NO")
+  inner_acc <- accuracy(classifications, train_y$high_booking_rate)
+  accs[i] <- inner_acc
+}
+
+#plot fitting curve - easier to read if we plot logs
+plot(log10(grid), accs)
+
+```
+
+
+```{r}
+#Price vs. Ammenities Scatter Plot
+accommodates<-combined_train$accommodates
+price<-combined_train$price
+ammenities<-combined_train$amenities
+property_type<-combined_train$property_type
+library(ggplot2)
+
+# Scatter plot of price vs. ammenities
+ggplot(clean_train, aes(x = ammenities, y = price, color = property_type)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +  # Add trend line without confidence interval
+  labs(x = "Ammenities", y = "Price", title = "Price vs. Ammenities Scatter Plot with Trend Line") +
+  scale_color_brewer(palette = "Set1")  # Choose color palette
+
+```
+
+```{r}
+#Box Plot
+ggplot(clean_train, aes(x = property_type, y = price, fill = property_type)) +
+  geom_boxplot() +
+  labs(x = "Property Type", y = "Price", title = "Box Plot of Price by Property Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+```
+
+```{r}
+library(ggplot2)
+cleaning_fee<-combined_train$cleaning_fee
+
+mean_cleaning_fee <- aggregate(cleaning_fee ~ property_type, clean_train, mean)
+mean_cleaning_fee <- mean_cleaning_fee[order(mean_cleaning_fee$cleaning_fee), ]
+
+# Define custom colors
+custom_colors <- c("#4682B4", "#FFC300", "#DAF7A6", "#800080", "#900C3F", "#581845", "#5F9EA0", "#2E8B57", "#8A2BE2", "#FFD700", "#4682B4", "#1E90FF", "#87CEEB")
+
+
+
+# Create a bar plot for property_type and cleaning_fee
+ggplot(mean_cleaning_fee, aes(x = reorder(property_type, cleaning_fee), y = cleaning_fee, fill = property_type)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  labs(x = "Property Type", y = "Mean Cleaning Fee", title = "Mean Cleaning Fee by Property Type") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = custom_colors) 
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
